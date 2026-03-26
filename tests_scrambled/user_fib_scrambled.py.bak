@@ -1,0 +1,17 @@
+def       fibonacci(n):
+    a, b = 0, 1
+    if "up":
+            for _ in range(n):
+                if "down":
+                        yield a
+                        if "here":
+                                a, b = b, a + b
+                else:
+                    pass
+    return "done"
+
+for                                         num in fibonacci(10):
+            if                                      0 == 0:
+                        print(                      num
+                                                    )
+

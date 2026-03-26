@@ -1,0 +1,12 @@
+transformers
+datasets
+accelerate
+peft
+trl
+safetensors
+sentencepiece
+tqdm
+rich
+bitsandbytes
+PySide6
+pytest
