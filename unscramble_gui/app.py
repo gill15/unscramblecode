@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shlex
 import tempfile
 from dataclasses import dataclass
@@ -21,9 +22,9 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QProgressBar,
     QDoubleSpinBox,
     QSpinBox,
-    QTabWidget,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -73,6 +74,9 @@ class Runner:
         self.status = status
         self.proc: QProcess | None = None
         self._on_finished = None
+        self._on_progress = None
+        self._title = ""
+        self._progress_re = re.compile(r"^PROGRESS\|(\d+)\|(\d+)\|(\d+)$")
 
     def running(self) -> bool:
         return self.proc is not None and self.proc.state() != QProcess.NotRunning
@@ -85,7 +89,7 @@ class Runner:
         self.proc.kill()
         self.status.setText("Stopped")
 
-    def run(self, spec: RunSpec, on_finished=None) -> None:
+    def run(self, spec: RunSpec, on_finished=None, on_progress=None) -> None:
         if self.running():
             QMessageBox.warning(None, "Busy", "A job is already running. Stop it first.")
             return
@@ -93,6 +97,8 @@ class Runner:
         self.log.clear()
         self._append(f"$ {spec.program} " + " ".join(shlex.quote(a) for a in spec.args))
         self.status.setText(f"Running: {spec.title}")
+        self._title = spec.title
+        self._on_progress = on_progress
 
         p = QProcess()
         p.setWorkingDirectory(spec.cwd)
@@ -118,7 +124,23 @@ class Runner:
     def _append(self, text: str) -> None:
         if not text:
             return
-        self.log.append(text)
+        # Parse machine-readable progress lines emitted by CLI.
+        lines = text.splitlines() or [text]
+        visible_lines: list[str] = []
+        for ln in lines:
+            m = self._progress_re.match(ln.strip())
+            if m:
+                pct = int(m.group(3))
+                self.status.setText(f"Running: {self._title} ({pct}%)")
+                if self._on_progress:
+                    try:
+                        self._on_progress(pct)
+                    except Exception:
+                        pass
+            else:
+                visible_lines.append(ln)
+        if visible_lines:
+            self.log.append("\n".join(visible_lines))
         sb = self.log.verticalScrollBar()
         sb.setValue(sb.maximum())
 
@@ -128,6 +150,7 @@ class Runner:
         cb = self._on_finished
         self.proc = None
         self._on_finished = None
+        self._on_progress = None
         if cb:
             try:
                 cb(code)
@@ -148,12 +171,15 @@ def QProcessEnvironment_from_dict(env: dict[str, str]):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Unscramble Code (Qwen2.5-1.5B)")
-        self.resize(1100, 780)
+        self.setWindowTitle("Unscramble Code")
+        self.resize(1200, 820)
 
         root = _repo_root()
 
         self.status = QLabel("Idle")
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
         self.log = QTextEdit()
         self.log.setReadOnly(True)
         self.log.setFont(QFont("Monospace"))
@@ -161,24 +187,19 @@ class MainWindow(QMainWindow):
 
         self.runner = Runner(self.log, self.status)
 
-        tabs = QTabWidget()
-        tabs.addTab(self._tab_dataset(root), "Dataset")
-        tabs.addTab(self._tab_train(root), "Train")
-        tabs.addTab(self._tab_unscramble(root), "Unscramble")
-        tabs.addTab(self._tab_paste_unscramble(root), "Paste Unscramble")
-        tabs.addTab(self._tab_batch_test(root), "Batch Test")
-        tabs.addTab(self._tab_project(root), "Project")
+        primary = self._tab_paste_unscramble(root)
 
         stop_btn = QPushButton("Stop")
         stop_btn.clicked.connect(self.runner.stop)
 
         bottom = QHBoxLayout()
+        bottom.addWidget(self.progress, 2)
         bottom.addWidget(self.status, 1)
         bottom.addWidget(stop_btn)
 
         layout = QVBoxLayout()
-        layout.addWidget(tabs, 3)
-        layout.addWidget(QLabel("Logs"))
+        layout.addWidget(primary, 5)
+        layout.addWidget(QLabel("Logs (behind the scenes)"))
         layout.addWidget(self.log, 2)
 
         bottom_w = QWidget()
@@ -630,33 +651,14 @@ class MainWindow(QMainWindow):
 
     def _tab_paste_unscramble(self, root: Path) -> QWidget:
         w = QWidget()
-        form = QFormLayout()
-
-        model = QLineEdit("Qwen/Qwen2.5-1.5B-Instruct")
-        lora = QLineEdit(str(root / "runs" / "qwen2.5-1.5b-unscramble-qlora-long"))
-        include_lora = QCheckBox("Use LoRA adapter")
-        include_lora.setChecked(True)
-
-        language = QComboBox()
-        language.addItems(["python", "javascript", "typescript", "bash", "java", "cpp", "go", "rust", "php", "text"])
-        language.setCurrentText("python")
-
-        passes = QSpinBox()
-        passes.setRange(1, 50)
-        passes.setValue(2)
-        chunk_lines = QSpinBox()
-        chunk_lines.setRange(40, 2000)
-        chunk_lines.setValue(180)
-        overlap = QSpinBox()
-        overlap.setRange(0, 500)
-        overlap.setValue(40)
-        max_new_tokens = QSpinBox()
-        max_new_tokens.setRange(32, 4000)
-        max_new_tokens.setValue(700)
-        temperature = QDoubleSpinBox()
-        temperature.setRange(0.0, 2.0)
-        temperature.setSingleStep(0.05)
-        temperature.setValue(0.0)
+        # Keep UI minimal; these backend defaults are fixed for one-click flow.
+        model_id = "Qwen/Qwen2.5-1.5B-Instruct"
+        lora_path = str(root / "runs" / "qwen2.5-1.5b-unscramble-qlora-long")
+        passes = 2
+        chunk_lines = 180
+        overlap = 40
+        max_new_tokens = 700
+        temperature = 0.0
 
         in_edit = QTextEdit()
         in_edit.setPlaceholderText("Paste scrambled code here...")
@@ -668,32 +670,7 @@ class MainWindow(QMainWindow):
         out_edit.setLineWrapMode(QTextEdit.NoWrap)
         out_edit.setPlaceholderText("Unscrambled code will appear here...")
 
-        form.addRow("Base model", model)
-        form.addRow("LoRA adapter folder", lora)
-        form.addRow("", include_lora)
-        form.addRow("Language", language)
-        form.addRow("Passes", passes)
-        form.addRow("Chunk lines", chunk_lines)
-        form.addRow("Overlap", overlap)
-        form.addRow("Max new tokens", max_new_tokens)
-        form.addRow("Temperature", temperature)
-
-        btn_uns = QPushButton("Unscramble Pasted Code")
-        btn_copy = QPushButton("Copy Output")
-        btn_clear = QPushButton("Clear")
-
-        def ext_for(lang: str) -> str:
-            return {
-                "python": ".py",
-                "javascript": ".js",
-                "typescript": ".ts",
-                "bash": ".sh",
-                "java": ".java",
-                "cpp": ".cpp",
-                "go": ".go",
-                "rust": ".rs",
-                "php": ".php",
-            }.get(lang, ".txt")
+        btn_uns = QPushButton("Unscramble")
 
         def run():
             text = in_edit.toPlainText()
@@ -701,38 +678,37 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "Missing input", "Paste scrambled code first.")
                 return
             py = _python_exe()
-            suffix = ext_for(language.currentText())
-            with tempfile.NamedTemporaryFile("w", suffix=suffix, delete=False, encoding="utf-8") as tf:
+            with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False, encoding="utf-8") as tf:
                 tf.write(text)
                 if not text.endswith("\n"):
                     tf.write("\n")
                 tmp_path = tf.name
             out_edit.clear()
+            self.progress.setValue(0)
             args = [
                 "-m",
                 "unscramble.unscramble_file",
                 "--model",
-                model.text().strip(),
+                model_id,
                 "--path",
                 tmp_path,
                 "--passes",
-                str(passes.value()),
+                str(passes),
                 "--chunk_lines",
-                str(chunk_lines.value()),
+                str(chunk_lines),
                 "--overlap",
-                str(overlap.value()),
+                str(overlap),
                 "--max_new_tokens",
-                str(max_new_tokens.value()),
+                str(max_new_tokens),
                 "--temperature",
-                str(temperature.value()),
+                str(temperature),
                 "--backup",
             ]
-            if include_lora.isChecked():
-                lp = lora.text().strip()
-                if lp:
-                    args += ["--lora", lp]
+            if lora_path:
+                args += ["--lora", lora_path]
 
             def done(exit_code: int) -> None:
+                self.progress.setValue(100 if exit_code == 0 else 0)
                 if exit_code != 0:
                     return
                 try:
@@ -750,25 +726,10 @@ class MainWindow(QMainWindow):
                     env={},
                 ),
                 on_finished=done,
+                on_progress=lambda pct: self.progress.setValue(max(0, min(100, pct))),
             )
 
-        def copy_output():
-            txt = out_edit.toPlainText()
-            if txt:
-                QApplication.clipboard().setText(txt)
-
-        def clear_all():
-            in_edit.clear()
-            out_edit.clear()
-
         btn_uns.clicked.connect(run)
-        btn_copy.clicked.connect(copy_output)
-        btn_clear.clicked.connect(clear_all)
-
-        btn_row = QHBoxLayout()
-        btn_row.addWidget(btn_uns)
-        btn_row.addWidget(btn_copy)
-        btn_row.addWidget(btn_clear)
 
         editors = QHBoxLayout()
         left = QVBoxLayout()
@@ -780,10 +741,9 @@ class MainWindow(QMainWindow):
         editors.addLayout(left, 1)
         editors.addLayout(right, 1)
 
-        box = QGroupBox("Paste -> One-click unscramble")
+        box = QGroupBox("Unscramble")
         vb = QVBoxLayout()
-        vb.addLayout(form)
-        vb.addLayout(btn_row)
+        vb.addWidget(btn_uns)
         vb.addLayout(editors)
         box.setLayout(vb)
 

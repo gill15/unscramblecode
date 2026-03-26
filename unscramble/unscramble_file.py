@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -141,10 +142,17 @@ def main() -> None:
         model = PeftModel.from_pretrained(model, args.lora)
     model.eval()
 
+    total_steps = args.passes * max(1, len(_chunk_ranges(len(lines), chunk_lines=args.chunk_lines, overlap=args.overlap)))
+    step_idx = 0
+    print(f"PROGRESS|0|{total_steps}|0")
+
     for p in range(args.passes):
         changed_any = False
         # iterate chunks on current lines
         for ch, chunk_text in _iter_chunks(lines, chunk_lines=args.chunk_lines, overlap=args.overlap):
+            step_idx += 1
+            pct = int((step_idx * 100) / max(1, total_steps))
+            print(f"PROGRESS|{step_idx}|{total_steps}|{pct}")
             user_prefix = plugin.user_prefix()
             msgs = make_messages(language, user_prefix + chunk_text, clean=None)
             try:
@@ -197,6 +205,45 @@ def main() -> None:
     # Write back, ensure file ends with newline
     new_text = "\n".join(lines) + "\n"
     new_text = plugin.finalize_file_text(original_text=orig_text, new_text=new_text)
+
+    # Fallback for badly broken Python files:
+    # if chunk mode produced no valid change and syntax is still broken, try one whole-file rescue generation.
+    if language.lower() == "python":
+        try:
+            ast.parse(new_text)
+        except SyntaxError:
+            rescue_prefix = (
+                plugin.user_prefix()
+                + "This file is heavily scrambled and may not parse.\n"
+                + "Reconstruct a single coherent valid Python file with minimal behavior changes.\n\n"
+            )
+            rescue_msgs = make_messages(language, rescue_prefix + orig_text, clean=None)
+            try:
+                rescue_prompt = tokenizer.apply_chat_template(rescue_msgs, tokenize=False, add_generation_prompt=True)
+            except Exception:
+                rescue_prompt = f"Language: {language}\n\n{rescue_prefix}SCRAMBLED:\n{orig_text}\n\nUNSCRAMBLED:\n"
+            rescue = _generate(
+                model=model,
+                tokenizer=tokenizer,
+                prompt=rescue_prompt,
+                max_new_tokens=max(args.max_new_tokens, 1200),
+                temperature=max(args.temperature, 0.2),
+            )
+            rescue = plugin.clean_model_output(rescue)
+            rescue = plugin.strip_noise(rescue)
+            rescue = plugin.postprocess_candidate(rescue)
+            if rescue.strip():
+                candidate_text = rescue.strip("\n") + "\n"
+                candidate_text = plugin.finalize_file_text(original_text=orig_text, new_text=candidate_text)
+                rv = plugin.validate_file_path(path=path, original_text=orig_text, new_text=candidate_text)
+                if rv.ok:
+                    try:
+                        ast.parse(candidate_text)
+                    except SyntaxError:
+                        pass
+                    else:
+                        new_text = candidate_text
+    print("PROGRESS|1|1|100")
     if new_text != orig_text:
         path.write_text(new_text, encoding="utf-8")
         print(f"Updated {path}")
