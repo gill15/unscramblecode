@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import shlex
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -10,6 +11,7 @@ from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
+    QComboBox,
     QFileDialog,
     QFormLayout,
     QGroupBox,
@@ -70,6 +72,7 @@ class Runner:
         self.log = log
         self.status = status
         self.proc: QProcess | None = None
+        self._on_finished = None
 
     def running(self) -> bool:
         return self.proc is not None and self.proc.state() != QProcess.NotRunning
@@ -82,7 +85,7 @@ class Runner:
         self.proc.kill()
         self.status.setText("Stopped")
 
-    def run(self, spec: RunSpec) -> None:
+    def run(self, spec: RunSpec, on_finished=None) -> None:
         if self.running():
             QMessageBox.warning(None, "Busy", "A job is already running. Stop it first.")
             return
@@ -102,6 +105,7 @@ class Runner:
         p.finished.connect(lambda code, st: self._finished(spec.title, code, st))
 
         self.proc = p
+        self._on_finished = on_finished
         p.start(spec.program, spec.args)
 
     def _append_bytes(self, b) -> None:
@@ -121,7 +125,14 @@ class Runner:
     def _finished(self, title: str, code: int, _status) -> None:
         self.status.setText(f"Finished: {title} (exit {code})")
         self._append(f"\n[exit_code={code}]")
+        cb = self._on_finished
         self.proc = None
+        self._on_finished = None
+        if cb:
+            try:
+                cb(code)
+            except Exception as e:
+                self._append(f"[callback_error] {e}")
 
 
 def QProcessEnvironment_from_dict(env: dict[str, str]):
@@ -154,6 +165,7 @@ class MainWindow(QMainWindow):
         tabs.addTab(self._tab_dataset(root), "Dataset")
         tabs.addTab(self._tab_train(root), "Train")
         tabs.addTab(self._tab_unscramble(root), "Unscramble")
+        tabs.addTab(self._tab_paste_unscramble(root), "Paste Unscramble")
         tabs.addTab(self._tab_batch_test(root), "Batch Test")
         tabs.addTab(self._tab_project(root), "Project")
 
@@ -613,6 +625,170 @@ class MainWindow(QMainWindow):
         lay = QVBoxLayout()
         lay.addWidget(box)
         lay.addStretch(1)
+        w.setLayout(lay)
+        return w
+
+    def _tab_paste_unscramble(self, root: Path) -> QWidget:
+        w = QWidget()
+        form = QFormLayout()
+
+        model = QLineEdit("Qwen/Qwen2.5-1.5B-Instruct")
+        lora = QLineEdit(str(root / "runs" / "qwen2.5-1.5b-unscramble-qlora-long"))
+        include_lora = QCheckBox("Use LoRA adapter")
+        include_lora.setChecked(True)
+
+        language = QComboBox()
+        language.addItems(["python", "javascript", "typescript", "bash", "java", "cpp", "go", "rust", "php", "text"])
+        language.setCurrentText("python")
+
+        passes = QSpinBox()
+        passes.setRange(1, 50)
+        passes.setValue(2)
+        chunk_lines = QSpinBox()
+        chunk_lines.setRange(40, 2000)
+        chunk_lines.setValue(180)
+        overlap = QSpinBox()
+        overlap.setRange(0, 500)
+        overlap.setValue(40)
+        max_new_tokens = QSpinBox()
+        max_new_tokens.setRange(32, 4000)
+        max_new_tokens.setValue(700)
+        temperature = QDoubleSpinBox()
+        temperature.setRange(0.0, 2.0)
+        temperature.setSingleStep(0.05)
+        temperature.setValue(0.0)
+
+        in_edit = QTextEdit()
+        in_edit.setPlaceholderText("Paste scrambled code here...")
+        in_edit.setFont(QFont("Monospace"))
+        in_edit.setLineWrapMode(QTextEdit.NoWrap)
+        out_edit = QTextEdit()
+        out_edit.setReadOnly(True)
+        out_edit.setFont(QFont("Monospace"))
+        out_edit.setLineWrapMode(QTextEdit.NoWrap)
+        out_edit.setPlaceholderText("Unscrambled code will appear here...")
+
+        form.addRow("Base model", model)
+        form.addRow("LoRA adapter folder", lora)
+        form.addRow("", include_lora)
+        form.addRow("Language", language)
+        form.addRow("Passes", passes)
+        form.addRow("Chunk lines", chunk_lines)
+        form.addRow("Overlap", overlap)
+        form.addRow("Max new tokens", max_new_tokens)
+        form.addRow("Temperature", temperature)
+
+        btn_uns = QPushButton("Unscramble Pasted Code")
+        btn_copy = QPushButton("Copy Output")
+        btn_clear = QPushButton("Clear")
+
+        def ext_for(lang: str) -> str:
+            return {
+                "python": ".py",
+                "javascript": ".js",
+                "typescript": ".ts",
+                "bash": ".sh",
+                "java": ".java",
+                "cpp": ".cpp",
+                "go": ".go",
+                "rust": ".rs",
+                "php": ".php",
+            }.get(lang, ".txt")
+
+        def run():
+            text = in_edit.toPlainText()
+            if not text.strip():
+                QMessageBox.warning(self, "Missing input", "Paste scrambled code first.")
+                return
+            py = _python_exe()
+            suffix = ext_for(language.currentText())
+            with tempfile.NamedTemporaryFile("w", suffix=suffix, delete=False, encoding="utf-8") as tf:
+                tf.write(text)
+                if not text.endswith("\n"):
+                    tf.write("\n")
+                tmp_path = tf.name
+            out_edit.clear()
+            args = [
+                "-m",
+                "unscramble.unscramble_file",
+                "--model",
+                model.text().strip(),
+                "--path",
+                tmp_path,
+                "--passes",
+                str(passes.value()),
+                "--chunk_lines",
+                str(chunk_lines.value()),
+                "--overlap",
+                str(overlap.value()),
+                "--max_new_tokens",
+                str(max_new_tokens.value()),
+                "--temperature",
+                str(temperature.value()),
+                "--backup",
+            ]
+            if include_lora.isChecked():
+                lp = lora.text().strip()
+                if lp:
+                    args += ["--lora", lp]
+
+            def done(exit_code: int) -> None:
+                if exit_code != 0:
+                    return
+                try:
+                    out_text = Path(tmp_path).read_text(encoding="utf-8", errors="replace")
+                    out_edit.setPlainText(out_text)
+                except Exception as e:
+                    QMessageBox.warning(self, "Read error", f"Could not read output: {e}")
+
+            self.runner.run(
+                RunSpec(
+                    title="Unscramble pasted code",
+                    program=py,
+                    args=args,
+                    cwd=str(root),
+                    env={},
+                ),
+                on_finished=done,
+            )
+
+        def copy_output():
+            txt = out_edit.toPlainText()
+            if txt:
+                QApplication.clipboard().setText(txt)
+
+        def clear_all():
+            in_edit.clear()
+            out_edit.clear()
+
+        btn_uns.clicked.connect(run)
+        btn_copy.clicked.connect(copy_output)
+        btn_clear.clicked.connect(clear_all)
+
+        btn_row = QHBoxLayout()
+        btn_row.addWidget(btn_uns)
+        btn_row.addWidget(btn_copy)
+        btn_row.addWidget(btn_clear)
+
+        editors = QHBoxLayout()
+        left = QVBoxLayout()
+        left.addWidget(QLabel("Scrambled input"))
+        left.addWidget(in_edit)
+        right = QVBoxLayout()
+        right.addWidget(QLabel("Unscrambled output"))
+        right.addWidget(out_edit)
+        editors.addLayout(left, 1)
+        editors.addLayout(right, 1)
+
+        box = QGroupBox("Paste -> One-click unscramble")
+        vb = QVBoxLayout()
+        vb.addLayout(form)
+        vb.addLayout(btn_row)
+        vb.addLayout(editors)
+        box.setLayout(vb)
+
+        lay = QVBoxLayout()
+        lay.addWidget(box)
         w.setLayout(lay)
         return w
 
